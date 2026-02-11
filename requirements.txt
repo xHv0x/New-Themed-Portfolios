@@ -1,0 +1,10 @@
+streamlit
+pandas
+numpy
+plotly
+pyarrow
+yfinance
+cvxpy
+osqp
+scs
+
