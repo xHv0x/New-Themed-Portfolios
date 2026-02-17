@@ -1,9 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-Created on Tue Feb 17 08:32:42 2026
-
-@author: hernanvillanueva
+"""app_v5.py
 
 Efficient Frontier — Generator (Streamlit)
 
