@@ -4,15 +4,14 @@
 
 Efficient Frontier — Generator (Streamlit)
 
-Key features (aligned with FronteraEficiente_Yields.py + your v5 specs):
+v5 goals (aligned with FronteraEficiente_Yields.py):
 - Compute efficient frontier on the fly (target-return sweep).
 - Long-only, fully-invested portfolios.
 - Optional global per-asset cap (slider 0.30 → 1.00; 1.00 means unconstrained).
-- Highlight GMV, MaxReturn, and slope≈1 (Δret/Δvol closest to 1; tie-break: lowest vol).
+- Highlight GMV, MaxReturn, and slope≈1 (Δret/Δvol closest to 1).
 - Use Adj Close and buy-and-hold (no rebalancing) for Base-100 performance.
 - Frontier estimation window is fixed to END_DATE_INCLUSIVE = 2025-10-23 (inclusive).
-- "Live performance" extends the Base-100 chart beyond the cutoff on button click.
-- Selecting a frontier point is done by clicking a point in the frontier chart.
+- "Live performance" (out-of-sample since cutoff) is shown only on button click.
 - Selection resets to blank when frontier is recomputed.
 
 Requires:
@@ -23,8 +22,8 @@ Requires:
 
 from __future__ import annotations
 
-import inspect
 import os
+from dataclasses import asdict
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -34,25 +33,6 @@ import plotly.graph_objects as go
 import streamlit as st
 
 import efficient_frontier_backend as efb
-
-
-# -----------------------------------------------------------------------------
-# Frontier density policy
-# -----------------------------------------------------------------------------
-
-TARGET_FRONTIER_POINTS = 60
-MIN_FRONTIER_POINTS = 40
-
-
-# -----------------------------------------------------------------------------
-# Plotly selection support (Streamlit >= 1.35)
-# -----------------------------------------------------------------------------
-
-try:
-    _sig = inspect.signature(st.plotly_chart)
-    _PLOTLY_SELECTION_SUPPORTED = ("on_select" in _sig.parameters) and ("selection_mode" in _sig.parameters)
-except Exception:
-    _PLOTLY_SELECTION_SUPPORTED = False
 
 
 # -----------------------------------------------------------------------------
@@ -68,6 +48,13 @@ st.markdown(
       h1, h2, h3 {margin-top: 0.2rem; margin-bottom: 0.4rem;}
       div[data-testid="stMetricValue"] {font-size: 2.0rem;}
       .small-note {color: rgba(49, 51, 63, 0.7); font-size: 0.85rem;}
+
+      /* Narrower sidebar (default is too wide) */
+      section[data-testid="stSidebar"],
+      section[data-testid="stSidebar"] > div {
+        width: 260px !important;
+        min-width: 260px !important;
+      }
     </style>
     """,
     unsafe_allow_html=True,
@@ -79,12 +66,14 @@ st.markdown("## Efficient Frontier — Generator (v5)")
 # -----------------------------------------------------------------------------
 # Reference tickers ("same as before")
 # NOTE: yfinance symbol for DXY is commonly "DX-Y.NYB".
+# We keep the display label as "DXY" while fetching via the yfinance symbol.
+# If your prior setup used a different symbol, change it here once.
 # -----------------------------------------------------------------------------
 
 REFERENCE_DISPLAY_TO_YF: Dict[str, str] = {
     "SPY": "SPY",
     "QQQ": "QQQ",
-    "DXY": "DX-Y.NYB",
+    "DXY": "DX-Y.NYB",  # display label "DXY" → yfinance "DX-Y.NYB"
 }
 REFERENCE_DISPLAY_ORDER: Tuple[str, str, str] = efb.REFERENCE_TICKERS
 
@@ -153,6 +142,7 @@ def _fetch_reference_prices_in_sample(
     px.index = pd.to_datetime(px.index)
     px = px.sort_index()
 
+    # Rename columns back to display tickers if yfinance symbols differ
     ren = {REFERENCE_DISPLAY_TO_YF.get(t, t): t for t in display_tickers}
     px = px.rename(columns=ren)
     return px
@@ -178,7 +168,7 @@ GROUPS = list(efb.GROUPS.keys())
 
 group = st.sidebar.selectbox("Group", GROUPS, index=0)
 
-# EUR expected return source
+# EUR expected return source (only meaningful for Eur)
 if group == "Eur":
     mu_method = st.sidebar.radio(
         "EUR expected return source",
@@ -189,23 +179,33 @@ if group == "Eur":
 else:
     mu_method = "historical"
     st.sidebar.caption("EUR yield proxy is only available for the Eur group.")
-
-cap = st.sidebar.slider(
-    "Max weight per asset (cap)",
-    min_value=0.30,
-    max_value=1.00,
-    value=1.00,
-    step=0.01,
-    help="Global cap applied to every asset weight. 1.00 means unconstrained.",
-)
-
-st.sidebar.divider()
-recompute = st.sidebar.button("Recompute frontier", type="primary", use_container_width=True)
-
 st.sidebar.markdown(
     f"<div class='small-note'>Estimation window ends on <b>{efb.END_DATE_INCLUSIVE.date()}</b> (inclusive).</div>",
     unsafe_allow_html=True,
 )
+
+
+# -----------------------------------------------------------------------------
+# Main controls (outside sidebar): cap slider + recompute button
+# -----------------------------------------------------------------------------
+
+ctl_l, ctl_r = st.columns([2.2, 1.0], gap="large")
+with ctl_l:
+    cap = st.slider(
+        "Max weight per asset (cap)",
+        min_value=0.30,
+        max_value=1.00,
+        value=float(st.session_state.get("cap_slider", 1.00)),
+        step=0.01,
+        help="Global cap applied to every asset weight. 1.00 means unconstrained.",
+        key="cap_slider",
+    )
+with ctl_r:
+    recompute = st.button("Recompute frontier", type="primary", use_container_width=True)
+
+# Frontier density policy: 60 target; fallback down to 40.
+TARGET_FRONTIER_POINTS = 60
+MIN_FRONTIER_POINTS = 40
 
 
 # -----------------------------------------------------------------------------
@@ -214,6 +214,8 @@ st.sidebar.markdown(
 
 
 def _current_frontier_key() -> Tuple:
+    # Only include the controls that change the optimization itself.
+    # Frontier density is handled internally via the 60→40 fallback policy.
     return (group, mu_method, round(float(cap), 4))
 
 
@@ -223,11 +225,16 @@ if "frontier_key" not in st.session_state:
 if "frontier_result" not in st.session_state:
     st.session_state.frontier_result = None
 
-if "frontier_front_points" not in st.session_state:
-    st.session_state.frontier_front_points = None
+if "frontier_points_requested" not in st.session_state:
+    st.session_state.frontier_points_requested = None
 
-if "frontier_requested_points" not in st.session_state:
-    st.session_state.frontier_requested_points = None
+if "frontier_points_produced" not in st.session_state:
+    st.session_state.frontier_points_produced = None
+
+if "frontier_run_id" not in st.session_state:
+    # Used to force the Plotly chart key to change on every recompute,
+    # so selections don't "stick" across different frontiers.
+    st.session_state.frontier_run_id = 0
 
 if "selected_point_idx" not in st.session_state:
     st.session_state.selected_point_idx = None
@@ -244,47 +251,46 @@ def _reset_selection_after_recompute():
     st.session_state.show_live = False
 
 
-def _count_frontier_points(fr: efb.FrontierResult) -> int:
-    d = fr.frontier
+def _count_frontier_points(fr_: efb.FrontierResult) -> int:
+    d = fr_.frontier
     if d is None or d.empty or "point_type" not in d.columns:
         return 0
     return int(d["point_type"].eq("Frontier").sum())
 
 
-def _compute_with_fallback(group: str, cap: float, mu_method: str) -> efb.FrontierResult:
-    """Try to compute a dense frontier; fallback from 60 down to 40.
+def _compute_with_fallback(group_: str, cap_: float, mu_method_: str) -> efb.FrontierResult:
+    """Try to compute 60 points; fallback down to 40.
 
-    Policy:
-      - Prefer 60 points.
-      - If solver fails to produce all points, try fewer targets.
-      - Track how many Frontier points we actually got.
-      - If < 40, app warns.
+    We record:
+      - frontier_points_requested: the n_points argument used for the best run
+      - frontier_points_produced:  how many frontier points were actually produced
     """
-    best_fr: Optional[efb.FrontierResult] = None
-    best_count = -1
-    best_n: Optional[int] = None
+    best_fr = None
+    best_produced = -1
+    best_requested = None
 
     for n in range(TARGET_FRONTIER_POINTS, MIN_FRONTIER_POINTS - 1, -1):
         fr_try = _compute_frontier_cached(
-            group=group,
-            cap=float(cap),
+            group=group_,
+            cap=float(cap_),
             n_points=int(n),
-            mu_method=mu_method,
+            mu_method=mu_method_,
             parquet_dir=".",
         )
-        c = _count_frontier_points(fr_try)
-        if c > best_count:
-            best_fr, best_count, best_n = fr_try, c, n
-        if c == n:
-            st.session_state.frontier_front_points = c
-            st.session_state.frontier_requested_points = n
+        produced = _count_frontier_points(fr_try)
+        if produced > best_produced:
+            best_fr, best_produced, best_requested = fr_try, produced, n
+        if produced == n:
+            # Perfect run.
+            st.session_state.frontier_points_requested = n
+            st.session_state.frontier_points_produced = produced
             return fr_try
 
     if best_fr is None:
-        raise RuntimeError("Could not compute any frontier points.")
+        raise RuntimeError("Frontier computation failed for all fallback point counts.")
 
-    st.session_state.frontier_front_points = best_count
-    st.session_state.frontier_requested_points = best_n
+    st.session_state.frontier_points_requested = best_requested
+    st.session_state.frontier_points_produced = best_produced
     return best_fr
 
 
@@ -295,16 +301,18 @@ def _compute_with_fallback(group: str, cap: float, mu_method: str) -> efb.Fronti
 if recompute or (st.session_state.frontier_key is None):
     with st.spinner("Computing frontier…"):
         try:
-            fr = _compute_with_fallback(group=group, cap=float(cap), mu_method=mu_method)
+            fr = _compute_with_fallback(group, float(cap), mu_method)
         except Exception as e:
             st.error(f"Could not compute frontier: {e}")
             st.stop()
 
     st.session_state.frontier_result = fr
     st.session_state.frontier_key = _current_frontier_key()
+    st.session_state.frontier_run_id = int(st.session_state.frontier_run_id) + 1
     _reset_selection_after_recompute()
 
 
+# If user changed controls but hasn't recomputed, warn and keep showing last result
 controls_key = _current_frontier_key()
 using_key = st.session_state.frontier_key
 fr: efb.FrontierResult = st.session_state.frontier_result
@@ -318,7 +326,7 @@ if using_key != controls_key:
 
 
 # -----------------------------------------------------------------------------
-# Helpers
+# Helpers for rendering
 # -----------------------------------------------------------------------------
 
 
@@ -328,6 +336,7 @@ def _ticker_cols(fr: efb.FrontierResult) -> List[str]:
 
 def _weights_from_row(row: pd.Series, tickers: List[str]) -> pd.Series:
     w = pd.Series({t: float(row[t]) for t in tickers}, dtype=float)
+    # cleanup + renormalize
     w[(w.abs() < 1e-12)] = 0.0
     w[w < 0] = 0.0
     s = float(w.sum())
@@ -365,7 +374,7 @@ def _render_point(title: str, row: pd.Series, tickers: List[str]):
     c3.metric("Ret/Vol", f"{ratio:.2f}" if np.isfinite(ratio) else "—")
 
     w = _weights_from_row(row, tickers)
-    _wdf, wdisp = _weights_table(w)
+    wdf, wdisp = _weights_table(w)
     st.dataframe(wdisp, use_container_width=True, height=_table_height_for(len(wdisp)), hide_index=True)
     st.caption(f"Weight sum: {float(w.sum()):.4f}")
 
@@ -385,15 +394,12 @@ def _make_frontier_figure(frontier_df: pd.DataFrame, title: str) -> go.Figure:
     row_s1 = _first("Slope1")
 
     fig = go.Figure()
-
-    # Frontier curve must be trace #0 (we rely on curve_number==0 for selection)
     fig.add_trace(
         go.Scatter(
             x=d_front["vol"],
             y=d_front["ret"],
             mode="lines+markers",
             name="Frontier",
-            marker=dict(size=7),
             hovertemplate="Vol: %{x:.2%}<br>Ret: %{y:.2%}<extra></extra>",
         )
     )
@@ -448,6 +454,7 @@ def _make_frontier_figure(frontier_df: pd.DataFrame, title: str) -> go.Figure:
         yaxis_title="Expected Return (annualized)",
         legend_title="",
         margin=dict(l=10, r=10, t=60, b=10),
+        # Make single-click point selection work reliably
         clickmode="event+select",
         dragmode="select",
     )
@@ -457,51 +464,41 @@ def _make_frontier_figure(frontier_df: pd.DataFrame, title: str) -> go.Figure:
     return fig
 
 
-def _extract_plotly_point_index(event_state) -> Optional[int]:
-    """Extract the first selected point_index from a Streamlit Plotly event_state.
-
-    We only accept selections from the frontier curve (curve_number == 0).
-    """
-    if event_state is None:
+def _extract_first_frontier_click(event) -> Optional[int]:
+    """Return point_index for the first selected point on the frontier curve (curve_number==0)."""
+    if event is None:
         return None
 
-    # event_state may be dict-like or attribute-like depending on Streamlit version
     sel = None
+    # Streamlit may return a PlotlyState-like object with .selection OR a dict.
+    if hasattr(event, "selection"):
+        sel = getattr(event, "selection")
+    elif isinstance(event, dict):
+        sel = event.get("selection")
+
+    if not sel or not isinstance(sel, dict):
+        return None
+
+    pts = sel.get("points")
+    if not pts:
+        return None
+
+    p0 = pts[0]
+    if not isinstance(p0, dict):
+        return None
+
+    curve = p0.get("curve_number", p0.get("curveNumber"))
+    if curve != 0:
+        return None
+
+    idx = p0.get("point_index", p0.get("pointIndex", p0.get("point_number", p0.get("pointNumber"))))
+    if idx is None:
+        return None
+
     try:
-        if isinstance(event_state, dict):
-            sel = event_state.get("selection")
-        else:
-            sel = getattr(event_state, "selection", None)
+        return int(idx)
     except Exception:
-        sel = None
-
-    points = []
-    if isinstance(sel, dict):
-        points = sel.get("points", []) or []
-    else:
-        try:
-            points = getattr(sel, "points", []) or []
-        except Exception:
-            points = []
-
-    if not points:
         return None
-
-    p0 = points[0]
-
-    def _get(d, *keys):
-        for k in keys:
-            if isinstance(d, dict) and k in d:
-                return d[k]
-        return None
-
-    curve = _get(p0, "curve_number", "curveNumber")
-    pidx = _get(p0, "point_index", "pointIndex", "pointNumber")
-
-    if curve != 0 or pidx is None:
-        return None
-
-    return int(pidx)
 
 
 # -----------------------------------------------------------------------------
@@ -509,32 +506,27 @@ def _extract_plotly_point_index(event_state) -> Optional[int]:
 # -----------------------------------------------------------------------------
 
 subtitle = ""
-if group == "Eur":
-    subtitle = " — SEC yield proxy" if mu_method == "yield_proxy" else " — historical"
+if fr.group == "Eur":
+    subtitle = " — SEC yield proxy" if fr.mu_method == "yield_proxy" else " — historical"
 
-front_count = st.session_state.frontier_front_points
-req_count = st.session_state.frontier_requested_points
-front_note = ""
-if isinstance(front_count, int) and isinstance(req_count, int):
-    if front_count < MIN_FRONTIER_POINTS:
-        front_note = f"  |  ⚠️ computed **{front_count}** points (below {MIN_FRONTIER_POINTS})"
-    elif front_count < TARGET_FRONTIER_POINTS:
-        front_note = f"  |  computed **{front_count}** points"
-    else:
-        front_note = f"  |  computed **{front_count}** points"
+produced_pts = st.session_state.frontier_points_produced
+if not isinstance(produced_pts, int):
+    produced_pts = _count_frontier_points(fr)
+    st.session_state.frontier_points_produced = produced_pts
 
 st.caption(
-    f"Group: **{group}**{subtitle}  |  cap: **{cap:.2f}**  |  cutoff: **{efb.END_DATE_INCLUSIVE.date()}**{front_note}"
+    f"Computed: **{fr.group}**{subtitle}  |  cap: **{float(fr.cap):.2f}**  |  cutoff: **{efb.END_DATE_INCLUSIVE.date()}**  |  frontier points: **{produced_pts}**"
 )
 
-if isinstance(front_count, int) and front_count < MIN_FRONTIER_POINTS:
+if isinstance(produced_pts, int) and produced_pts < MIN_FRONTIER_POINTS:
     st.warning(
-        f"Only **{front_count}** frontier points were produced (minimum target is {MIN_FRONTIER_POINTS}). "
+        f"Only **{produced_pts}** frontier points were produced (target is {TARGET_FRONTIER_POINTS}). "
         "The curve may look coarse; consider loosening constraints (higher cap) or switching group/method."
     )
 
 left, right = st.columns([2.2, 1.0], gap="large")
 
+# View toggle buttons (frontier vs base100)
 with left:
     b1, b2 = st.columns([1, 1])
     if b1.button("Frontier view", use_container_width=True):
@@ -543,48 +535,43 @@ with left:
         st.session_state.view_mode = "Base100"
 
 
+# Frontier plot + selection
 frontier_df = fr.frontier.copy()
 tickers = _ticker_cols(fr)
 
+# ensure point types exist
 if "point_type" not in frontier_df.columns:
     frontier_df["point_type"] = "Frontier"
 
+# Primary frontier series for selection mapping
 frontier_only = frontier_df[frontier_df["point_type"].eq("Frontier")].copy()
 frontier_only = frontier_only.sort_values("vol").reset_index(drop=True)
 
-fig = _make_frontier_figure(frontier_df=frontier_df, title=f"Efficient Frontier — {group}{subtitle}")
-
+fig = _make_frontier_figure(
+    frontier_df=frontier_df,
+    title=f"Efficient Frontier — {fr.group}{subtitle}",
+)
 
 with left:
     if st.session_state.view_mode == "Frontier":
-        if _PLOTLY_SELECTION_SUPPORTED:
-            event = st.plotly_chart(
-                fig,
-                key=f"frontier_v5_{group}_{mu_method}_{using_key}",
-                on_select="rerun",
-                selection_mode="points",
-                height=520,
-                use_container_width=True,
-            )
-            picked = _extract_plotly_point_index(event)
-            if picked is not None:
-                if picked != st.session_state.selected_point_idx:
-                    st.session_state.selected_point_idx = picked
-                    st.session_state.show_live = False
-        else:
-            st.plotly_chart(
-                fig,
-                key=f"frontier_v5_{group}_{mu_method}_{using_key}",
-                height=520,
-                use_container_width=True,
-            )
-            st.warning(
-                "Your Streamlit version does not support Plotly point selection. "
-                "Upgrade Streamlit (>= 1.35) to enable click-to-select."
-            )
+        event = st.plotly_chart(
+            fig,
+            key=f"frontier_v5_{fr.group}_{fr.mu_method}_{st.session_state.frontier_run_id}",
+            on_select="rerun",
+            selection_mode="points",
+            height=520,
+            use_container_width=True,
+        )
+
+        clicked = _extract_first_frontier_click(event)
+        if clicked is not None and not frontier_only.empty:
+            clicked = max(0, min(int(clicked), len(frontier_only) - 1))
+            if st.session_state.selected_point_idx != clicked:
+                st.session_state.selected_point_idx = clicked
+                st.session_state.show_live = False
 
         if st.session_state.selected_point_idx is None:
-            st.info("Frontier updated — click a point on the frontier to select a portfolio.")
+            st.info("Frontier updated — please select a portfolio point.")
 
     else:
         if st.session_state.selected_point_idx is None:
@@ -594,26 +581,27 @@ with left:
             sel_idx = max(0, min(sel_idx, len(frontier_only) - 1))
             row_sel = frontier_only.iloc[sel_idx]
 
-            # In-sample prices (aligned)
-            px_group_raw = _load_group_prices_cached(group)
-            px_group_raw = px_group_raw.loc[:efb.END_DATE_INCLUSIVE].copy()
-            px_group_raw = px_group_raw.dropna(axis=0, how="any")
+            # -----------------------------------------------------------------
+            # Base 100 (in-sample) for: Selected, GMV, MaxReturn, Slope1 + refs
+            # -----------------------------------------------------------------
 
-            # References in-sample
+            # In-sample prices (aligned)
+            px_group_raw = _load_group_prices_cached(fr.group)
+            px_group_raw = px_group_raw.loc[:efb.END_DATE_INCLUSIVE].copy().dropna(axis=0, how="any")
+
+            # Reference tickers in-sample
             ref_disp = tuple(REFERENCE_DISPLAY_ORDER)
-            ref_px: Optional[pd.DataFrame] = None
+            ref_px = None
             try:
                 ref_px = _fetch_reference_prices_in_sample(
                     display_tickers=ref_disp,
                     start=pd.Timestamp(px_group_raw.index.min()),
                     end_inclusive=pd.Timestamp(px_group_raw.index.max()),
-                )
-                ref_px = ref_px.dropna(axis=0, how="any")
+                ).dropna(axis=0, how="any")
             except Exception as e:
                 st.warning(f"Could not load SPY/QQQ/DXY for the in-sample chart: {e}")
-                ref_px = None
 
-            # Common calendar across portfolio and refs
+            # Align calendars (intersection)
             if ref_px is not None and not ref_px.empty:
                 common_idx = px_group_raw.index.intersection(ref_px.index)
                 px_group = px_group_raw.loc[common_idx].copy()
@@ -621,8 +609,8 @@ with left:
             else:
                 px_group = px_group_raw
 
-            # Portfolio weights: Selected + anchors
-            anchors: Dict[str, pd.Series] = {}
+            # Weights: Selected + anchors
+            anchors = {}
             anchors["Selected"] = _weights_from_row(row_sel, tickers)
 
             gmv_row = frontier_df[frontier_df["point_type"].eq("GMV")].iloc[0]
@@ -634,13 +622,12 @@ with left:
             if not s1_row.empty:
                 anchors["Slope1"] = _weights_from_row(s1_row.iloc[0], tickers)
 
-            # Build in-sample base100 for portfolios
+            # Portfolio base100 (buy & hold, no rebalancing)
             port_df = pd.concat(
                 {name: efb.base100_buy_and_hold(px_group, w) for name, w in anchors.items()},
                 axis=1,
             )
 
-            # Add benchmark refs (base100)
             joined = port_df.copy()
             if ref_px is not None and not ref_px.empty:
                 joined = pd.concat([joined, ref_px], axis=1).dropna(axis=0, how="any")
@@ -652,21 +639,19 @@ with left:
                 st.error("Base 100 chart has no data after alignment.")
                 st.stop()
 
+            # Deterministic colors; keep the same color for in-sample + live segment
+            palette = pc.qualitative.Plotly
+            col_names = list(joined.columns)
+            color_map = {name: palette[i % len(palette)] for i, name in enumerate(col_names)}
+
             st.caption("Toggle any line on/off by clicking the legend.")
             if st.button("Live performance (extend chart)", use_container_width=True):
                 st.session_state.show_live = True
 
             cutoff_actual = pd.Timestamp(joined.index.max())
 
-            # Deterministic color mapping per series (pre + post cutoff)
-            palette = pc.qualitative.Plotly
-            color_map = {str(c): palette[i % len(palette)] for i, c in enumerate(list(joined.columns))}
-
             base_fig = go.Figure()
-
-            # In-sample traces
             for col in joined.columns:
-                c = color_map.get(str(col))
                 base_fig.add_trace(
                     go.Scatter(
                         x=joined.index,
@@ -675,14 +660,15 @@ with left:
                         name=str(col),
                         legendgroup=str(col),
                         showlegend=True,
-                        line=dict(color=c),
+                        line=dict(color=color_map[str(col)]),
                     )
                 )
 
-            # Live extension (dotted) — same colors as in-sample
+            # Live segment (dotted), only if user explicitly requests
             if st.session_state.show_live:
                 with st.spinner("Fetching live prices…"):
                     start_live = cutoff_actual
+
                     ref_yf = [REFERENCE_DISPLAY_TO_YF.get(t, t) for t in ref_disp]
                     fetch_list = tuple(list(tickers) + ref_yf)
                     try:
@@ -693,60 +679,53 @@ with left:
 
                 px_live = px_live.copy()
                 ren = {REFERENCE_DISPLAY_TO_YF.get(t, t): t for t in ref_disp}
-                px_live = px_live.rename(columns=ren)
-                px_live = px_live.dropna(axis=0, how="any")
+                px_live = px_live.rename(columns=ren).dropna(axis=0, how="any")
 
-                # Portfolio live segment (scaled to continue from in-sample)
                 px_live_port = px_live[[t for t in tickers if t in px_live.columns]].copy()
-                if px_live_port.empty:
-                    st.warning("Live prices missing portfolio tickers; cannot extend chart.")
-                else:
+                if not px_live_port.empty:
                     for name, w in anchors.items():
                         live_raw = efb.base100_buy_and_hold(px_live_port, w)
-                        if name not in joined.columns:
-                            continue
-                        scale = float(joined.loc[cutoff_actual, name]) / 100.0
-                        live_scaled = (live_raw * scale).loc[lambda s: s.index > cutoff_actual]
+                        scale = float(joined.loc[cutoff_actual, name]) / 100.0 if name in joined.columns else 1.0
+                        live_scaled = (live_raw * scale).loc[live_raw.index > cutoff_actual]
                         if live_scaled.empty:
                             continue
 
                         mode = "lines+markers" if name == "Selected" else "lines"
-                        trace_kwargs = dict(
-                            x=live_scaled.index,
-                            y=live_scaled.values,
-                            mode=mode,
-                            name=str(name),
-                            legendgroup=str(name),
-                            showlegend=False,
-                            line=dict(dash="dot", color=color_map.get(str(name))),
-                        )
-                        if name == "Selected":
-                            trace_kwargs["marker"] = dict(color=color_map.get(str(name)))
-                        base_fig.add_trace(go.Scatter(**trace_kwargs))
-
-                    # Benchmarks live segment
-                    for t in ref_disp:
-                        if t not in px_live.columns or t not in joined.columns:
-                            continue
-                        live_ref = efb.base100_single(px_live[t])
-                        scale = float(joined.loc[cutoff_actual, t]) / 100.0
-                        live_ref = (live_ref * scale).loc[lambda s: s.index > cutoff_actual]
-                        if live_ref.empty:
-                            continue
                         base_fig.add_trace(
                             go.Scatter(
-                                x=live_ref.index,
-                                y=live_ref.values,
-                                mode="lines",
-                                name=str(t),
-                                legendgroup=str(t),
+                                x=live_scaled.index,
+                                y=live_scaled.values,
+                                mode=mode,
+                                name=str(name),
+                                legendgroup=str(name),
                                 showlegend=False,
-                                line=dict(dash="dot", color=color_map.get(str(t))),
+                                line=dict(dash="dot", color=color_map.get(str(name))),
                             )
                         )
 
+                # Benchmarks live segment
+                for t in ref_disp:
+                    if t not in px_live.columns or t not in joined.columns:
+                        continue
+                    live_ref = efb.base100_single(px_live[t])
+                    scale = float(joined.loc[cutoff_actual, t]) / 100.0
+                    live_ref = (live_ref * scale).loc[live_ref.index > cutoff_actual]
+                    if live_ref.empty:
+                        continue
+                    base_fig.add_trace(
+                        go.Scatter(
+                            x=live_ref.index,
+                            y=live_ref.values,
+                            mode="lines",
+                            name=str(t),
+                            legendgroup=str(t),
+                            showlegend=False,
+                            line=dict(dash="dot", color=color_map.get(str(t))),
+                        )
+                    )
+
             base_fig.update_layout(
-                title=f"Base 100 (Buy & Hold, Adj Close) — {group}{subtitle}",
+                title=f"Base 100 (Buy & Hold, Adj Close) — {fr.group}{subtitle}",
                 xaxis_title="Date",
                 yaxis_title="Index (Base 100)",
                 margin=dict(l=10, r=10, t=60, b=10),
@@ -756,7 +735,7 @@ with left:
 
             if st.session_state.show_live:
                 st.caption(
-                    "Live segment is shown as dotted lines (Selected also has markers). Colors are fixed across the cutoff."
+                    "Live segment is shown as dotted lines (Selected also has markers) and extends the chart beyond the cutoff."
                 )
             else:
                 st.caption("Base 100 uses buy & hold with initial weights (no rebalancing).")
@@ -766,7 +745,7 @@ with left:
 with right:
     if st.session_state.selected_point_idx is None:
         st.markdown("### Selected portfolio")
-        st.caption("Click a point on the frontier to see weights and metrics.")
+        st.caption("Select a point on the frontier to see weights and metrics.")
     else:
         sel_idx = int(st.session_state.selected_point_idx)
         sel_idx = max(0, min(sel_idx, len(frontier_only) - 1))
@@ -801,18 +780,16 @@ with c2:
             _render_point("Max return (long-only)", mx.iloc[0], tickers)
 
 
+# Debug (optional)
 with st.expander("Debug (frontier params)"):
     st.json(
         {
             "group": fr.group,
             "mu_method": fr.mu_method,
             "cap": fr.cap,
-            "requested_targets": st.session_state.frontier_requested_points,
-            "frontier_points_produced": st.session_state.frontier_front_points,
-            "n_points_param": fr.n_points,
+            "n_points": fr.n_points,
             "prices_start": str(fr.start_date.date()),
             "prices_end": str(fr.end_date.date()),
             "tickers_used": fr.tickers,
-            "plotly_selection_supported": _PLOTLY_SELECTION_SUPPORTED,
         }
     )
