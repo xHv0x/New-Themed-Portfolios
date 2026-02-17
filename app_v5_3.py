@@ -49,16 +49,12 @@ st.markdown(
       div[data-testid="stMetricValue"] {font-size: 2.0rem;}
       .small-note {color: rgba(49, 51, 63, 0.70); font-size: 0.85rem;}
 
-      /* Make sidebar narrower only when expanded; do NOT reserve width when collapsed */
+      /* Make sidebar narrower when expanded.
+         IMPORTANT: do NOT override the collapsed state; Streamlit should reclaim space naturally. */
       section[data-testid="stSidebar"][aria-expanded="true"],
       section[data-testid="stSidebar"][aria-expanded="true"] > div {
         width: 260px !important;
         min-width: 260px !important;
-      }
-      section[data-testid="stSidebar"][aria-expanded="false"],
-      section[data-testid="stSidebar"][aria-expanded="false"] > div {
-        width: 0px !important;
-        min-width: 0px !important;
       }
     </style>
     """,
@@ -388,30 +384,17 @@ def _make_frontier_figure(frontier_df: pd.DataFrame, title: str) -> go.Figure:
 
     fig = go.Figure()
 
-    # Trace 0: frontier line (clicking on line should also yield point_index)
+    # Keep frontier as a SINGLE trace (mode="lines+markers"), like app_v4.
+    # This is the most reliable way to get Streamlit's point selection to work.
     fig.add_trace(
         go.Scatter(
             x=d_front["vol"],
             y=d_front["ret"],
-            mode="lines",
-            name="Frontier",
-            hoverinfo="skip",
-            line=dict(width=2),
-        )
-    )
-
-    # Trace 1: frontier markers (easiest to click)
-    fig.add_trace(
-        go.Scatter(
-            x=d_front["vol"],
-            y=d_front["ret"],
-            mode="markers",
+            mode="lines+markers",
             name="Frontier",
             marker=dict(size=9),
+            line=dict(width=2),
             hovertemplate="Vol: %{x:.2%}<br>Ret: %{y:.2%}<extra></extra>",
-            showlegend=False,
-            selected=dict(marker=dict(size=11, line=dict(width=2))),
-            unselected=dict(marker=dict(opacity=0.85)),
         )
     )
 
@@ -466,7 +449,6 @@ def _make_frontier_figure(frontier_df: pd.DataFrame, title: str) -> go.Figure:
         legend_title="",
         margin=dict(l=10, r=10, t=60, b=10),
         clickmode="event+select",
-        dragmode="select",
     )
     fig.update_xaxes(tickformat=".1%")
     fig.update_yaxes(tickformat=".1%")
@@ -543,36 +525,21 @@ with left:
             )
             st.session_state.last_plotly_event = event
 
-            # Click-to-select: handle both Streamlit return formats (object with .selection OR dict)
+            # Click-to-select (same pattern that worked in app_v4)
             try:
                 sel = None
                 if isinstance(event, dict):
-                    sel = event.get("selection") or event.get("selected") or event.get("points")
+                    sel = event.get("selection")
                 else:
                     sel = getattr(event, "selection", None)
 
-                # Normalize points list
-                points = None
-                if isinstance(sel, dict):
-                    points = sel.get("points")
-                elif hasattr(sel, "get"):
-                    try:
-                        points = sel.get("points")
-                    except Exception:
-                        points = None
-                elif isinstance(sel, list):
-                    points = sel
-                elif sel is not None and hasattr(sel, "points"):
-                    points = getattr(sel, "points", None)
-
-                if points:
-                    p0 = points[0]
-                    curve = p0.get("curve_number", p0.get("curveNumber", None))
-                    pidx = p0.get("point_index", p0.get("pointIndex", p0.get("pointNumber", None)))
-                    if curve in (0, 1) and pidx is not None:
-                        st.session_state.selected_point_idx = int(pidx)
+                if sel and isinstance(sel, dict) and sel.get("points"):
+                    p0 = sel["points"][0]
+                    if p0.get("curve_number", None) == 0:
+                        st.session_state.selected_point_idx = int(p0["point_index"])
                         st.session_state.show_live = False
             except Exception:
+                # If Streamlit changes the payload, the Debug expander will show us.
                 pass
 
         else:
